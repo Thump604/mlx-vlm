@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -274,6 +274,8 @@ class LagunaModel(nn.Module):
         inputs: mx.array,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
+        hidden_sink: Optional[List[mx.array]] = None,
     ) -> mx.array:
         if inputs_embeds is not None:
             h = inputs_embeds
@@ -289,14 +291,56 @@ class LagunaModel(nn.Module):
                 h, cache[self.swa_idx], window_size=self.args.sliding_window
             )
 
-        for layer, c in zip(self.layers, cache):
+        capture_set = set(capture_layer_ids or [])
+        for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = (
                 sliding_mask
                 if layer.attention_type == "sliding_attention"
                 else full_mask
             )
             h = layer(h, mask, c)
+            if hidden_sink is not None and layer_idx in capture_set:
+                hidden_sink.append(h)
         return self.norm(h)
+
+
+def _prepare_laguna_capture_kwargs(kwargs: dict) -> tuple[Optional[List[int]], Any]:
+    capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+    hidden_sink = [] if capture_layer_ids is not None else None
+    return capture_layer_ids, kwargs.pop("hidden_sink", hidden_sink)
+
+
+def _laguna_chunked_prefill_policy(draft_model, draft_kind, prefill_kwargs) -> bool:
+    if draft_model is None:
+        return True
+    return (
+        draft_kind == "dflash" and prefill_kwargs.get("capture_layer_ids") is not None
+    )
+
+
+def _rollback_laguna_speculative_cache(
+    caches: List[Any], accepted: Any, block_size: int
+) -> int:
+    if isinstance(accepted, int):
+        accepted_values = [accepted]
+    elif isinstance(accepted, mx.array):
+        accepted_values = [int(v) for v in accepted.reshape(-1).tolist()]
+    else:
+        accepted_values = [int(v) for v in accepted]
+
+    max_accepted = max(accepted_values)
+    trim = block_size - (max_accepted + 1)
+    if trim <= 0:
+        return max_accepted
+
+    for layer_cache in caches:
+        if layer_cache is None:
+            continue
+        if not layer_cache.is_trimmable():
+            raise RuntimeError("Laguna DFlash requires rollback-capable target caches.")
+        if layer_cache.trim(trim) != trim:
+            raise RuntimeError("Laguna DFlash target cache rollback was incomplete.")
+    return max_accepted
 
 
 class LanguageModel(nn.Module):
@@ -321,12 +365,45 @@ class LanguageModel(nn.Module):
             inputs = kwargs.get("input_ids")
         if inputs_embeds is None:
             inputs_embeds = input_embeddings
-        out = self.model(inputs, cache, inputs_embeds)
+        capture_layer_ids, hidden_sink = _prepare_laguna_capture_kwargs(kwargs)
+        out = self.model(
+            inputs,
+            cache,
+            inputs_embeds,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+        )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden_sink)
+
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        return _laguna_chunked_prefill_policy(
+            draft_model, draft_kind, prefill_kwargs or {}
+        )
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: Any,
+        accepted: Any,
+        block_size: int,
+    ) -> int:
+        """Rewind target caches after a Laguna DFlash verification block."""
+        del gdn_states
+        return _rollback_laguna_speculative_cache(caches, accepted, block_size)
 
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:

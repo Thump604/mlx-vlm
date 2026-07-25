@@ -13,6 +13,8 @@ from .utils import (
     create_model_card,
     fetch_from_hub,
     get_model_path,
+    load_config,
+    load_model,
     save_config,
     save_weights,
     skip_multimodal_module,
@@ -28,6 +30,24 @@ QUANT_RECIPES = [
     "mixed_4_6",
     "mixed_4_8",
 ]
+
+
+def _load_conversion_inputs(model_path: Path, trust_remote_code: bool):
+    source_config = load_config(model_path, trust_remote_code=trust_remote_code)
+    if source_config.get("dflash_config") is not None:
+        # Trained drafts share target architecture metadata but do not ship a
+        # tokenizer or processor. The target model owns both.
+        return (
+            load_model(model_path, lazy=True, trust_remote_code=trust_remote_code),
+            source_config,
+            None,
+        )
+    return fetch_from_hub(model_path, lazy=True, trust_remote_code=trust_remote_code)
+
+
+def _save_processor(processor, mlx_path: Path) -> None:
+    if processor is not None:
+        processor.save_pretrained(mlx_path)
 
 
 def _quantization_params(
@@ -298,9 +318,7 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
-    model, config, processor = fetch_from_hub(
-        model_path, lazy=True, trust_remote_code=trust_remote_code
-    )
+    model, config, processor = _load_conversion_inputs(model_path, trust_remote_code)
 
     model_quant_predicate = getattr(model, "quant_predicate", None)
 
@@ -407,7 +425,7 @@ def convert(
                 shutil.rmtree(dest)
             shutil.copytree(item, dest)
 
-    processor.save_pretrained(mlx_path)
+    _save_processor(processor, mlx_path)
 
     save_config(config, config_path=mlx_path / "config.json")
 
