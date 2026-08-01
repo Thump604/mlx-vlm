@@ -26,6 +26,12 @@ import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.models.cache import (
+    BufferedRotatingKVCache,
+    CacheList,
+    KVCache,
+    RotatingKVCache,
+)
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
@@ -490,7 +496,7 @@ def test_speculative_prompt_cache_uses_unbatched_cache_for_single_mtp(monkeypatc
     assert result is unbatched_cache
 
 
-def test_speculative_prompt_cache_uses_batched_cache_for_batch_or_dflash(monkeypatch):
+def test_speculative_prompt_cache_uses_batched_cache_for_batches(monkeypatch):
     lm = object()
     batched_cache = object()
 
@@ -508,16 +514,38 @@ def test_speculative_prompt_cache_uses_batched_cache_for_batch_or_dflash(monkeyp
         )
         is batched_cache
     )
-    assert (
-        speculative_utils.make_speculative_prompt_cache(
-            lm,
-            draft_kind="dflash",
-            batch_size=1,
-            left_padding=[0],
-            make_cache=lambda *args, **kwargs: batched_cache,
-        )
-        is batched_cache
+
+
+def test_speculative_prompt_cache_buffers_single_dflash_rotating_cache(monkeypatch):
+    lm = object()
+    regular = [KVCache(), RotatingKVCache(max_size=4)]
+
+    monkeypatch.setattr(
+        speculative_utils.cache, "make_prompt_cache", lambda target: regular
     )
+
+    result = speculative_utils.make_speculative_prompt_cache(
+        lm,
+        draft_kind="dflash",
+        batch_size=1,
+        left_padding=[0],
+        make_cache=lambda *args, **kwargs: pytest.fail(),
+    )
+
+    assert result[0] is regular[0]
+    assert isinstance(result[1], BufferedRotatingKVCache)
+    assert result[1].max_size == 4
+
+
+def test_dflash_buffers_existing_nested_rotating_cache():
+    nested = CacheList(RotatingKVCache(max_size=4), KVCache())
+    prompt_cache = [nested]
+
+    result = speculative_utils.buffer_dflash_target_cache(prompt_cache)
+
+    assert result is prompt_cache
+    assert isinstance(prompt_cache[0][0], BufferedRotatingKVCache)
+    assert isinstance(prompt_cache[0][1], KVCache)
 
 
 def test_speculative_server_reads_draft_block_size_env(monkeypatch):

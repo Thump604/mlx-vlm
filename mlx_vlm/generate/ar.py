@@ -20,6 +20,7 @@ from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
+    buffer_dflash_target_cache,
     make_speculative_prompt_cache,
     run_speculative_rounds,
     run_speculative_server_rounds,
@@ -145,6 +146,23 @@ def normalize_resize_shape(values):
     ):
         raise ValueError("resize_shape must contain 1 or 2 integers")
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
+
+
+def _prepare_generation_prompt_cache(
+    prompt_cache,
+    model,
+    max_kv_size,
+    draft_model,
+    draft_kind,
+):
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(
+            model.language_model,
+            max_kv_size=max_kv_size,
+        )
+    if draft_model is not None and draft_kind == "dflash":
+        return buffer_dflash_target_cache(prompt_cache)
+    return prompt_cache
 
 
 def generate_step(
@@ -298,12 +316,9 @@ def generate_step(
 
     thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
 
-    # Create the KV cache for generation
-    if prompt_cache is None:
-        prompt_cache = cache.make_prompt_cache(
-            model.language_model,
-            max_kv_size=max_kv_size,
-        )
+    prompt_cache = _prepare_generation_prompt_cache(
+        prompt_cache, model, max_kv_size, draft_model, draft_kind
+    )
 
     # Speculative decoding setup
     last_outputs = None

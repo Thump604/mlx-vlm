@@ -55,6 +55,7 @@ __all__ = [
     "_speculative_walk_batch_uniform_acceptance",
     "_speculative_walk_deferred_greedy",
     "format_speculative_stats",
+    "buffer_dflash_target_cache",
     "get_speculative_rounds_batch",
     "make_speculative_prompt_cache",
     "run_speculative_rounds",
@@ -62,6 +63,29 @@ __all__ = [
     "speculative_hidden_state",
     "speculative_prefill_kwargs",
 ]
+
+
+def _buffer_dflash_cache_entry(entry, *, buffer_size: int):
+    if isinstance(entry, cache.CacheList):
+        entry.caches = tuple(
+            _buffer_dflash_cache_entry(child, buffer_size=buffer_size)
+            for child in entry.caches
+        )
+        return entry
+    if (
+        isinstance(entry, cache.RotatingKVCache)
+        and not isinstance(entry, cache.BufferedRotatingKVCache)
+        and entry.keep == 0
+    ):
+        return cache.BufferedRotatingKVCache.from_cache(entry, buffer_size=buffer_size)
+    return entry
+
+
+def buffer_dflash_target_cache(prompt_cache, *, buffer_size: int = 64):
+    """Make an existing target cache safe for DFlash reject rollback."""
+    for index, entry in enumerate(prompt_cache):
+        prompt_cache[index] = _buffer_dflash_cache_entry(entry, buffer_size=buffer_size)
+    return prompt_cache
 
 
 def format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
@@ -112,6 +136,9 @@ def make_speculative_prompt_cache(
 ):
     if draft_kind == "mtp" and batch_size == 1:
         return cache.make_prompt_cache(lm)
+    if draft_kind == "dflash" and batch_size == 1:
+        prompt_cache = cache.make_prompt_cache(lm)
+        return buffer_dflash_target_cache(prompt_cache)
     return make_cache(lm, left_padding)
 
 

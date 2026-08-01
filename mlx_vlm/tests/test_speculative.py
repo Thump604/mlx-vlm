@@ -18,6 +18,7 @@ from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
+import mlx_vlm.models.laguna.language as laguna_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.models.cache import (
@@ -1211,6 +1212,33 @@ def test_buffered_rotating_cache_matches_temporal_multitoken_tail_and_trim():
     assert buffered.state[0].reshape(-1).tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
 
 
+def test_laguna_rollback_preserves_sliding_history_after_window_crossing():
+    cache = BufferedRotatingKVCache(max_size=4, buffer_size=4)
+    initial = mx.arange(4, dtype=mx.float32).reshape(1, 1, 4, 1)
+    cache.update_and_fetch(initial, initial + 10)
+    verify = mx.arange(4, 7, dtype=mx.float32).reshape(1, 1, 3, 1)
+    cache.update_and_fetch(verify, verify + 10)
+
+    accepted = laguna_language.LanguageModel.rollback_speculative_cache(
+        object(), [cache], None, accepted=0, block_size=3
+    )
+
+    assert accepted == 0
+    assert cache.offset == 5
+    assert cache.state[0].reshape(-1).tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def test_laguna_rollback_rejects_non_trimmable_rotating_cache():
+    cache = RotatingKVCache(max_size=4)
+    values = mx.arange(4, dtype=mx.float32).reshape(1, 1, 4, 1)
+    cache.update_and_fetch(values, values)
+
+    with pytest.raises(RuntimeError, match="rollback-capable"):
+        laguna_language.LanguageModel.rollback_speculative_cache(
+            object(), [cache], None, accepted=0, block_size=3
+        )
+
+
 def test_mtp_target_cache_buffers_cache_list_local_rotating_cache():
     base = RotatingKVCache(max_size=4, keep=0)
     keys = mx.arange(4, dtype=mx.float32).reshape(1, 1, 4, 1)
@@ -1929,6 +1957,18 @@ def test_dflash_block_total_uses_runtime_default_but_honors_override():
 
     assert speculative_utils._dflash_block_total(draft_model, None) == 14
     assert speculative_utils._dflash_block_total(draft_model, 16) == 16
+
+
+def test_dflash_runtime_block_eight_represents_seven_speculative_tokens():
+    draft_model = SimpleNamespace(
+        config=SimpleNamespace(block_size=16, runtime_block_size=None)
+    )
+
+    verify_block_size = speculative_utils._dflash_block_total(draft_model, 8)
+
+    # DFlash verifies the previously committed bonus token plus N-1 drafts.
+    assert verify_block_size == 8
+    assert verify_block_size - 1 == 7
 
 
 def test_dflash_block_total_falls_back_to_configured_block_size():

@@ -160,6 +160,13 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "KVCache")
         self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
+        captured = model.language_model(
+            inputs, cache=model.make_cache(), capture_layer_ids=[0, 1]
+        )
+        self.assertEqual(len(captured.hidden_states), 2)
+        self.assertEqual(captured.hidden_states[0].shape, (1, 3, config.hidden_size))
+        self.assertEqual(captured.hidden_states[1].shape, (1, 3, config.hidden_size))
+
     def test_laguna_nvfp4_compressed_tensors_config(self):
         from mlx_vlm.models import laguna
 
