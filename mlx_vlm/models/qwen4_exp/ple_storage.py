@@ -231,12 +231,16 @@ class QuantizedMMapNGramEmbedding:
             packed_bytes = self.row_width // 2
             aux_bytes = self.row_width // 32 * 2
             packed = raw[:, :packed_bytes].reshape(len(missing_ids), -1).view("<u4")
-            scales = raw[
-                :, packed_bytes : packed_bytes + aux_bytes
-            ].reshape(len(missing_ids), -1).view("<u2")
-            biases = raw[:, packed_bytes + aux_bytes :].reshape(
-                len(missing_ids), -1
-            ).view("<u2")
+            scales = (
+                raw[:, packed_bytes : packed_bytes + aux_bytes]
+                .reshape(len(missing_ids), -1)
+                .view("<u2")
+            )
+            biases = (
+                raw[:, packed_bytes + aux_bytes :]
+                .reshape(len(missing_ids), -1)
+                .view("<u2")
+            )
             loaded = list(zip(packed, scales, biases))
             self._bytes += raw.nbytes
         elif missing_ids:
