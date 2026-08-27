@@ -19,7 +19,23 @@ import mlx.core as mx
 import numpy as np
 
 PLE_MARKER = ".ple.ple_embedding.ngram_embedding.shards."
-_DTYPES = {"U32": np.dtype("<u4"), "BF16": np.dtype("<u2")}
+_DTYPES = {"U32": np.dtype("<u4"), "BF16": np.dtype("<u2"), "U8": np.dtype("u1")}
+_QUANTIZATION_LAYOUTS = {
+    (4, 32, "affine"): (("weight", "U32"), ("scales", "BF16"), ("biases", "BF16")),
+    (4, 16, "nvfp4"): (("weight", "U32"), ("scales", "U8")),
+}
+
+
+def _quantization_layout(quantization):
+    key = (
+        quantization.get("bits"),
+        quantization.get("group_size"),
+        quantization.get("mode"),
+    )
+    try:
+        return _QUANTIZATION_LAYOUTS[key]
+    except KeyError as error:
+        raise ValueError(f"unsupported PLE quantization: {quantization}") from error
 
 
 @dataclass(frozen=True)
@@ -38,7 +54,7 @@ def _bfloat16_to_float32(values):
 
 
 class QuantizedMMapNGramEmbedding:
-    """Read-only affine-Q4 PLE table backed by safetensors byte ranges."""
+    """Read-only Q4 PLE table backed by safetensors byte ranges."""
 
     MANIFEST_VERSION = 2
 
@@ -56,15 +72,16 @@ class QuantizedMMapNGramEmbedding:
             raise ValueError(f"manifest missing fields: {sorted(missing)}")
         if manifest["version"] != self.MANIFEST_VERSION:
             raise ValueError(f"unsupported manifest version: {manifest['version']}")
-        quantization = manifest["quantization"]
-        if quantization != {"bits": 4, "group_size": 32, "mode": "affine"}:
-            raise ValueError(f"unsupported PLE quantization: {quantization}")
+        self.quantization = manifest["quantization"]
+        self._tensor_layout = _quantization_layout(self.quantization)
+        self._tensor_names = tuple(name for name, _ in self._tensor_layout)
+        self._group_size = int(self.quantization["group_size"])
 
         source_root = Path(manifest["source_root"])
         if not source_root.is_absolute():
             source_root = (manifest_path.parent / source_root).resolve()
         self.row_width = int(manifest["row_width"])
-        if self.row_width <= 0 or self.row_width % 32:
+        if self.row_width <= 0 or self.row_width % self._group_size:
             raise ValueError("row_width must be positive and divisible by group_size")
 
         self._interleaved = None
@@ -76,7 +93,11 @@ class QuantizedMMapNGramEmbedding:
             data_path = manifest_path.parent / data_name
             self.row_count = int(manifest["row_count"])
             row_stride = int(manifest["row_stride"])
-            expected_stride = self.row_width // 2 + 2 * (self.row_width // 32) * 2
+            expected_stride = self.row_width // 2 + sum(
+                self.row_width // self._group_size * _DTYPES[dtype].itemsize
+                for name, dtype in self._tensor_layout
+                if name != "weight"
+            )
             if row_stride != expected_stride:
                 raise ValueError("interleaved Q4 row stride does not match row width")
             expected_size = self.row_count * row_stride
@@ -122,11 +143,7 @@ class QuantizedMMapNGramEmbedding:
             if start != expected_start or count <= 0:
                 raise ValueError("PLE shards must be positive, contiguous, and ordered")
             arrays = {}
-            for name, expected_dtype in (
-                ("weight", "U32"),
-                ("scales", "BF16"),
-                ("biases", "BF16"),
-            ):
+            for name, expected_dtype in self._tensor_layout:
                 tensor = entry[name]
                 if tensor["dtype"] != expected_dtype:
                     raise ValueError(f"unexpected {name} dtype: {tensor['dtype']}")
@@ -151,13 +168,16 @@ class QuantizedMMapNGramEmbedding:
                 )
             if arrays["weight"].shape[1] * 8 != self.row_width:
                 raise ValueError("packed weight width does not match row_width")
-            groups = self.row_width // 32
+            groups = self.row_width // self._group_size
             expected_aux_shape = (groups,)
-            if (
-                arrays["scales"].shape[1:] != expected_aux_shape
-                or arrays["biases"].shape[1:] != expected_aux_shape
+            if any(
+                arrays[name].shape[1:] != expected_aux_shape
+                for name in self._tensor_names
+                if name != "weight"
             ):
-                raise ValueError("scale/bias shape does not match Q4 group layout")
+                raise ValueError(
+                    "auxiliary tensor shape does not match Q4 group layout"
+                )
             self._shards.append((start, start + count, arrays))
             expected_start += count
         self.row_count = expected_start
@@ -171,12 +191,19 @@ class QuantizedMMapNGramEmbedding:
         if self._interleaved is not None:
             raw = np.array(self._interleaved[row_id], copy=True)
             packed_bytes = self.row_width // 2
-            aux_bytes = self.row_width // 32 * 2
-            row = (
-                raw[:packed_bytes].view("<u4"),
-                raw[packed_bytes : packed_bytes + aux_bytes].view("<u2"),
-                raw[packed_bytes + aux_bytes :].view("<u2"),
-            )
+            row = []
+            offset = 0
+            for name, dtype_name in self._tensor_layout:
+                byte_count = (
+                    packed_bytes
+                    if name == "weight"
+                    else self.row_width
+                    // self._group_size
+                    * _DTYPES[dtype_name].itemsize
+                )
+                row.append(raw[offset : offset + byte_count].view(_DTYPES[dtype_name]))
+                offset += byte_count
+            row = tuple(row)
             self._misses += 1
             self._bytes += raw.nbytes
             if self.cache_rows:
@@ -189,7 +216,7 @@ class QuantizedMMapNGramEmbedding:
                 local = row_id - start
                 row = tuple(
                     np.array(arrays[name][local], copy=True)
-                    for name in ("weight", "scales", "biases")
+                    for name in self._tensor_names
                 )
                 self._misses += 1
                 self._bytes += sum(value.nbytes for value in row)
@@ -206,11 +233,13 @@ class QuantizedMMapNGramEmbedding:
         if row_ids.ndim != 1:
             raise ValueError("row_ids must be one-dimensional")
         if not row_ids.size:
-            groups = self.row_width // 32
-            return (
-                np.empty((0, self.row_width // 8), dtype="<u4"),
-                np.empty((0, groups), dtype="<u2"),
-                np.empty((0, groups), dtype="<u2"),
+            groups = self.row_width // self._group_size
+            return tuple(
+                np.empty(
+                    (0, self.row_width // 8 if name == "weight" else groups),
+                    dtype=_DTYPES[dtype],
+                )
+                for name, dtype in self._tensor_layout
             )
 
         rows = [None] * len(row_ids)
@@ -229,19 +258,23 @@ class QuantizedMMapNGramEmbedding:
         if missing_ids and self._interleaved is not None:
             raw = np.array(self._interleaved[np.asarray(missing_ids)], copy=True)
             packed_bytes = self.row_width // 2
-            aux_bytes = self.row_width // 32 * 2
-            packed = raw[:, :packed_bytes].reshape(len(missing_ids), -1).view("<u4")
-            scales = (
-                raw[:, packed_bytes : packed_bytes + aux_bytes]
-                .reshape(len(missing_ids), -1)
-                .view("<u2")
-            )
-            biases = (
-                raw[:, packed_bytes + aux_bytes :]
-                .reshape(len(missing_ids), -1)
-                .view("<u2")
-            )
-            loaded = list(zip(packed, scales, biases))
+            columns = []
+            offset = 0
+            for name, dtype_name in self._tensor_layout:
+                byte_count = (
+                    packed_bytes
+                    if name == "weight"
+                    else self.row_width
+                    // self._group_size
+                    * _DTYPES[dtype_name].itemsize
+                )
+                columns.append(
+                    raw[:, offset : offset + byte_count]
+                    .reshape(len(missing_ids), -1)
+                    .view(_DTYPES[dtype_name])
+                )
+                offset += byte_count
+            loaded = list(zip(*columns))
             self._bytes += raw.nbytes
         elif missing_ids:
             loaded = [None] * len(missing_ids)
@@ -253,13 +286,12 @@ class QuantizedMMapNGramEmbedding:
                 if not selected.size:
                     continue
                 local = missing_array[selected] - start
-                weight = np.array(arrays["weight"][local], copy=True)
-                scales = np.array(arrays["scales"][local], copy=True)
-                biases = np.array(arrays["biases"][local], copy=True)
-                self._bytes += weight.nbytes + scales.nbytes + biases.nbytes
-                for output_index, row in zip(
-                    selected.tolist(), zip(weight, scales, biases)
-                ):
+                columns = [
+                    np.array(arrays[name][local], copy=True)
+                    for name in self._tensor_names
+                ]
+                self._bytes += sum(column.nbytes for column in columns)
+                for output_index, row in zip(selected.tolist(), zip(*columns)):
                     loaded[output_index] = row
             if any(row is None for row in loaded):
                 raise IndexError("n-gram row outside mmap table")
@@ -275,7 +307,10 @@ class QuantizedMMapNGramEmbedding:
                 while len(self._cache) > self.cache_rows:
                     self._cache.popitem(last=False)
 
-        return tuple(np.stack([row[index] for row in rows]) for index in range(3))
+        return tuple(
+            np.stack([row[index] for row in rows])
+            for index in range(len(self._tensor_layout))
+        )
 
     def __call__(self, row_ids):
         started = time.perf_counter()
@@ -287,13 +322,17 @@ class QuantizedMMapNGramEmbedding:
             return mx.zeros((*ids.shape, self.row_width), dtype=mx.bfloat16)
 
         unique_ids, inverse = np.unique(flat_ids, return_inverse=True)
-        packed_np, scales_np, biases_np = self._read_rows(unique_ids)
+        row_tensors = self._read_rows(unique_ids)
         duplicate_count = flat_ids.size - unique_ids.size
         self._hits += duplicate_count
-        packed = mx.array(packed_np, dtype=mx.uint32)
-        scales = mx.array(_bfloat16_to_float32(scales_np)).astype(mx.bfloat16)
-        biases = mx.array(_bfloat16_to_float32(biases_np)).astype(mx.bfloat16)
-        values = mx.dequantize(packed, scales, biases, group_size=32, bits=4)
+        packed = mx.array(row_tensors[0], dtype=mx.uint32)
+        if self.quantization["mode"] == "nvfp4":
+            scales = mx.array(row_tensors[1], dtype=mx.uint8)
+            values = mx.dequantize(packed, scales, group_size=16, bits=4, mode="nvfp4")
+        else:
+            scales = mx.array(_bfloat16_to_float32(row_tensors[1])).astype(mx.bfloat16)
+            biases = mx.array(_bfloat16_to_float32(row_tensors[2])).astype(mx.bfloat16)
+            values = mx.dequantize(packed, scales, biases, group_size=32, bits=4)
         # np.unique sorts even when every ID is distinct, so the inverse is
         # required to restore caller order in both the unique and duplicate
         # cases.
@@ -318,7 +357,7 @@ class QuantizedMMapNGramEmbedding:
 
 
 def build_quantized_ple_manifest(model_path, output_path, *, cache_rows=0):
-    """Index Q4 PLE tensors in place without copying their payload bytes."""
+    """Index supported Q4 PLE tensors without copying their payload bytes."""
 
     model_path = Path(model_path).resolve()
     output_path = Path(output_path).resolve()
@@ -351,38 +390,46 @@ def build_quantized_ple_manifest(model_path, output_path, *, cache_rows=0):
 
     shards = []
     row_start = 0
+    manifest_quantization = None
+    tensor_layout = None
     ordered_prefixes = sorted(prefixes, key=lambda value: int(value.rsplit(".", 1)[1]))
     for prefix in ordered_prefixes:
         quantization = config.get("quantization_config") or config.get(
             "quantization", {}
         )
         params = quantization.get(prefix, quantization)
-        expected = {"bits": 4, "group_size": 32, "mode": "affine"}
-        if any(params.get(key) != value for key, value in expected.items()):
-            raise ValueError(f"PLE tensor {prefix!r} is not affine Q4/group-32")
-        weight = tensor_descriptor(f"{prefix}.weight")
-        scales = tensor_descriptor(f"{prefix}.scales")
-        biases = tensor_descriptor(f"{prefix}.biases")
-        if weight["dtype"] != "U32" or any(
-            item["dtype"] != "BF16" for item in (scales, biases)
-        ):
+        current_quantization = {
+            key: params.get(key) for key in ("bits", "group_size", "mode")
+        }
+        current_layout = _quantization_layout(current_quantization)
+        if manifest_quantization is None:
+            manifest_quantization = current_quantization
+            tensor_layout = current_layout
+        elif current_quantization != manifest_quantization:
+            raise ValueError("all PLE shards must use the same quantization")
+        tensors = {
+            name: tensor_descriptor(f"{prefix}.{name}")
+            for name, _dtype in tensor_layout
+        }
+        if any(tensors[name]["dtype"] != dtype for name, dtype in tensor_layout):
             raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 dtype layout")
+        weight = tensors["weight"]
         if len(weight["shape"]) != 2 or int(weight["shape"][1]) % 4:
             raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 shape layout")
         row_count = int(weight["shape"][0])
-        groups = int(weight["shape"][1]) // 4
-        if scales["shape"] != [row_count, groups] or biases["shape"] != [
-            row_count,
-            groups,
-        ]:
+        row_width = int(weight["shape"][1]) * 8
+        groups = row_width // int(current_quantization["group_size"])
+        if any(
+            tensors[name]["shape"] != [row_count, groups]
+            for name, _dtype in tensor_layout
+            if name != "weight"
+        ):
             raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 shape layout")
         shards.append(
             {
                 "row_start": row_start,
                 "row_count": row_count,
-                "weight": weight,
-                "scales": scales,
-                "biases": biases,
+                **tensors,
             }
         )
         row_start += row_count
@@ -392,7 +439,7 @@ def build_quantized_ple_manifest(model_path, output_path, *, cache_rows=0):
         "layout": "safetensors_ranges",
         "row_width": int(shards[0]["weight"]["shape"][1]) * 8,
         "row_count": row_start,
-        "quantization": {"bits": 4, "group_size": 32, "mode": "affine"},
+        "quantization": manifest_quantization,
         "cache_rows": int(cache_rows),
         "shards": shards,
     }
@@ -424,16 +471,22 @@ def materialize_interleaved_ple_store(
         model_path, manifest_path, cache_rows=cache_rows
     )
     row_width = int(range_manifest["row_width"])
+    quantization = range_manifest["quantization"]
+    tensor_layout = _quantization_layout(quantization)
     packed_bytes = row_width // 2
-    aux_bytes = row_width // 32 * 2
-    row_stride = packed_bytes + 2 * aux_bytes
+    group_size = int(quantization["group_size"])
+    row_stride = packed_bytes + sum(
+        row_width // group_size * _DTYPES[dtype].itemsize
+        for name, dtype in tensor_layout
+        if name != "weight"
+    )
     total_size = int(range_manifest["row_count"]) * row_stride
     with data_path.open("wb") as stream:
         stream.truncate(total_size)
     source_root = (manifest_path.parent / range_manifest["source_root"]).resolve()
     for shard in range_manifest["shards"]:
         arrays = {}
-        for name in ("weight", "scales", "biases"):
+        for name, _dtype in tensor_layout:
             tensor = shard[name]
             arrays[name] = np.memmap(
                 source_root / tensor["file"],
@@ -453,21 +506,19 @@ def materialize_interleaved_ple_store(
                 offset=(row_start + local_start) * row_stride,
                 shape=(local_end - local_start, row_stride),
             )
-            output[:, :packed_bytes] = (
-                np.asarray(arrays["weight"][local_start:local_end])
-                .view(np.uint8)
-                .reshape(local_end - local_start, packed_bytes)
-            )
-            output[:, packed_bytes : packed_bytes + aux_bytes] = (
-                np.asarray(arrays["scales"][local_start:local_end])
-                .view(np.uint8)
-                .reshape(local_end - local_start, aux_bytes)
-            )
-            output[:, packed_bytes + aux_bytes :] = (
-                np.asarray(arrays["biases"][local_start:local_end])
-                .view(np.uint8)
-                .reshape(local_end - local_start, aux_bytes)
-            )
+            offset = 0
+            for name, dtype_name in tensor_layout:
+                byte_count = (
+                    packed_bytes
+                    if name == "weight"
+                    else row_width // group_size * _DTYPES[dtype_name].itemsize
+                )
+                output[:, offset : offset + byte_count] = (
+                    np.asarray(arrays[name][local_start:local_end])
+                    .view(np.uint8)
+                    .reshape(local_end - local_start, byte_count)
+                )
+                offset += byte_count
             output.flush()
             del output
         del arrays
@@ -481,7 +532,7 @@ def materialize_interleaved_ple_store(
         "row_width": row_width,
         "row_count": int(range_manifest["row_count"]),
         "row_stride": row_stride,
-        "quantization": {"bits": 4, "group_size": 32, "mode": "affine"},
+        "quantization": quantization,
         "cache_rows": int(cache_rows),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -524,7 +575,7 @@ def prepare_external_ple_model(source_path, target_path, *, cache_rows=0):
                 * _DTYPES[item[name]["dtype"]].itemsize
             )
             for item in ple_manifest["shards"]
-            for name in ("weight", "scales", "biases")
+            for name, _dtype in _quantization_layout(ple_manifest["quantization"])
         )
     )
     (target_path / "model.safetensors.index.json").write_text(
@@ -546,7 +597,7 @@ def prepare_external_ple_model(source_path, target_path, *, cache_rows=0):
 
     config = json.loads((source_path / "config.json").read_text())
     config["text_config"]["ple_storage"] = {
-        "manifest": str(manifest_path),
+        "manifest": manifest_path.name,
         "cache_rows": int(cache_rows),
     }
     quantization = config.get("quantization", {})

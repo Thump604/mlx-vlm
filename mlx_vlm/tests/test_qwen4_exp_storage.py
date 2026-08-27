@@ -61,6 +61,39 @@ def _write_quantized_store(tmp_path, table, *, cache_rows=0):
     return path, expected
 
 
+def _write_nvfp4_store(tmp_path, table, *, cache_rows=0):
+    weight, scales = mx.quantize(table, group_size=16, bits=4, mode="nvfp4")
+    mx.eval(weight, scales)
+    arrays = {"weight": np.asarray(weight), "scales": np.asarray(scales)}
+    offset = 0
+    tensors = {}
+    data_path = tmp_path / "rows.bin"
+    with data_path.open("wb") as stream:
+        for name, dtype in (("weight", "U32"), ("scales", "U8")):
+            values = arrays[name]
+            stream.write(values.tobytes())
+            tensors[name] = {
+                "file": data_path.name,
+                "offset": offset,
+                "dtype": dtype,
+                "shape": list(values.shape),
+            }
+            offset += values.nbytes
+    manifest = {
+        "version": 2,
+        "source_root": ".",
+        "row_width": table.shape[1],
+        "row_count": table.shape[0],
+        "quantization": {"bits": 4, "group_size": 16, "mode": "nvfp4"},
+        "cache_rows": cache_rows,
+        "shards": [{"row_start": 0, "row_count": table.shape[0], **tensors}],
+    }
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    expected = mx.dequantize(weight, scales, group_size=16, bits=4, mode="nvfp4")
+    return path, expected
+
+
 def test_quantized_mmap_lookup_matches_resident_dequantization(tmp_path):
     table = mx.arange(64 * 160).reshape(64, 160).astype(mx.float32) / 100
     path, expected = _write_quantized_store(tmp_path, table, cache_rows=4)
@@ -89,6 +122,20 @@ def test_quantized_mmap_lookup_preserves_unsorted_unique_ids(tmp_path):
         np.asarray(actual.astype(mx.float32)),
         np.asarray(expected.astype(mx.float32))[ids],
     )
+
+
+def test_nvfp4_mmap_lookup_matches_resident_dequantization(tmp_path):
+    table = mx.arange(16 * 160).reshape(16, 160).astype(mx.float32) / 100
+    path, expected = _write_nvfp4_store(tmp_path, table, cache_rows=4)
+    store = QuantizedMMapNGramEmbedding(path)
+    ids = np.array([[1, 7, 1], [15, 7, 2]])
+    actual = store(ids)
+    mx.eval(actual, expected)
+    np.testing.assert_array_equal(
+        np.asarray(actual.astype(mx.float32)),
+        np.asarray(expected.astype(mx.float32))[ids],
+    )
+    assert store.stats.bytes_read == 4 * (20 * 4 + 10)
 
 
 def test_quantized_store_fails_closed_for_truncation_and_escape(tmp_path):
@@ -144,6 +191,8 @@ def test_prepare_external_model_indexes_existing_q4_ranges(tmp_path):
     prepare_external_ple_model(source, target)
     range_manifest = json.loads((target / "ple-store.json").read_text())
     assert range_manifest["source_root"] == "../source"
+    target_config = json.loads((target / "config.json").read_text())
+    assert target_config["text_config"]["ple_storage"]["manifest"] == "ple-store.json"
     materialize_interleaved_ple_store(source, target / "ple-store.json")
     interleaved_manifest = json.loads((target / "ple-store.json").read_text())
     assert interleaved_manifest["source_root"] == "../source"
@@ -155,6 +204,58 @@ def test_prepare_external_model_indexes_existing_q4_ranges(tmp_path):
     store = QuantizedMMapNGramEmbedding(target / "ple-store.json")
     actual = store(np.array([0, 7]))
     expected = mx.dequantize(weight, scales, biases, group_size=32, bits=4)[[0, 7]]
+    mx.eval(actual, expected)
+    np.testing.assert_array_equal(
+        np.asarray(actual.astype(mx.float32)),
+        np.asarray(expected.astype(mx.float32)),
+    )
+
+
+def test_prepare_external_model_supports_nvfp4(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    table = mx.arange(8 * 160).reshape(8, 160).astype(mx.float32) / 100
+    weight, scales = mx.quantize(table, group_size=16, bits=4, mode="nvfp4")
+    prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0"
+    tensors = {
+        f"{prefix}.weight": weight,
+        f"{prefix}.scales": scales,
+        "language_model.embed_tokens.weight": mx.ones((2, 2)),
+    }
+    file_name = "model.safetensors"
+    mx.save_safetensors(str(source / file_name), tensors)
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": {key: file_name for key in tensors}})
+    )
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "text_config": {},
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 16,
+                    "mode": "nvfp4",
+                },
+            }
+        )
+    )
+
+    prepare_external_ple_model(source, target)
+    range_manifest = json.loads((target / "ple-store.json").read_text())
+    assert range_manifest["source_root"] == "../source"
+    assert range_manifest["quantization"] == {
+        "bits": 4,
+        "group_size": 16,
+        "mode": "nvfp4",
+    }
+    materialize_interleaved_ple_store(source, target / "ple-store.json")
+    assert (target / "ple-q4.rows").stat().st_size == 8 * 90
+    store = QuantizedMMapNGramEmbedding(target / "ple-store.json")
+    actual = store(np.array([0, 7]))
+    expected = mx.dequantize(weight, scales, group_size=16, bits=4, mode="nvfp4")[
+        [0, 7]
+    ]
     mx.eval(actual, expected)
     np.testing.assert_array_equal(
         np.asarray(actual.astype(mx.float32)),
@@ -183,7 +284,7 @@ def test_build_manifest_rejects_non_q4_before_writing(tmp_path):
     )
     manifest_path = tmp_path / "output" / "ple-store.json"
 
-    with pytest.raises(ValueError, match="is not affine Q4/group-32"):
+    with pytest.raises(ValueError, match="unsupported PLE quantization"):
         build_quantized_ple_manifest(source, manifest_path)
 
     assert not manifest_path.exists()

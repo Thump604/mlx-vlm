@@ -1796,13 +1796,15 @@ class LanguageModel(Qwen3_5LanguageModel):
             else:
                 caches.append(QSAKVCache())
         return caches
+
     @property
     def quant_predicate(self):
         def predicate(path, _module):
             if ".ple.ple_embedding.ngram_embedding.shards." in path:
-                # PLE rows are 160-wide, so retain the requested quantization
-                # while selecting a compatible group size.
-                return {"group_size": 32}
+                # Affine group-64 cannot represent 160-wide PLE rows. Preserve
+                # compatible modes such as NVFP4/group-16 and otherwise fall
+                # back to affine group-32.
+                return {"fallback_group_size": 32}
             if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
                 return {"group_size": 64, "bits": 8, "mode": "affine"}
             return True

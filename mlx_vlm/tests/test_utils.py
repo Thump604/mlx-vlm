@@ -341,7 +341,7 @@ def test_quantize_module():
     config = {}
 
     def group32_predicate(_path: str, _module: nn.Module):
-        return {"group_size": 32}
+        return {"fallback_group_size": 32}
 
     _, updated_config = quantize_model(
         module,
@@ -356,6 +356,27 @@ def test_quantize_module():
     assert updated_config["quantization"]["language_model"]["group_size"] == 32
     assert updated_config["quantization"]["language_model"]["bits"] == 4
     assert updated_config["quantization"]["language_model"]["mode"] == "affine"
+
+    # A compatible requested group remains authoritative. In particular,
+    # NVFP4 must retain its required group-16 layout rather than taking the
+    # affine fallback used for 160-wide PLE rows.
+    module = DummyModule((10, 160))
+    config = {}
+    _, updated_config = quantize_model(
+        module,
+        config,
+        group_size=16,
+        bits=4,
+        mode="nvfp4",
+        quant_predicate=group32_predicate,
+    )
+    assert module.language_model.group_size == 16
+    assert module.language_model.mode == "nvfp4"
+    assert updated_config["quantization"]["language_model"] == {
+        "group_size": 16,
+        "bits": 4,
+        "mode": "nvfp4",
+    }
 
     # Test mxfp4 quantization
     module = DummyModule((10, 64))

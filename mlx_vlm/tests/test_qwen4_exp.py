@@ -625,7 +625,7 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertIn(mapped, sanitized)
         self.assertEqual(sanitized[mapped].dtype, mx.bfloat16)
 
-    def test_quantization_uses_group32_for_ple_shards(self):
+    def test_quantization_uses_compatible_group_for_ple_shards(self):
         model = qwen4_exp.Model(tiny_config())
         predicate = model.quant_predicate
         path = (
@@ -634,7 +634,7 @@ class Qwen4ExpTests(unittest.TestCase):
         )
         self.assertEqual(
             predicate(path, None),
-            {"group_size": 32},
+            {"fallback_group_size": 32},
         )
 
 
