@@ -178,11 +178,7 @@ def test_build_manifest_rejects_non_q4_before_writing(tmp_path):
     )
     (source / "config.json").write_text(
         json.dumps(
-            {
-                "quantization": {
-                    prefix: {"bits": 8, "group_size": 32, "mode": "affine"}
-                }
-            }
+            {"quantization": {prefix: {"bits": 8, "group_size": 32, "mode": "affine"}}}
         )
     )
     manifest_path = tmp_path / "output" / "ple-store.json"

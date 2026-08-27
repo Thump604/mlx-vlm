@@ -371,10 +371,10 @@ def build_quantized_ple_manifest(model_path, output_path, *, cache_rows=0):
             raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 shape layout")
         row_count = int(weight["shape"][0])
         groups = int(weight["shape"][1]) // 4
-        if (
-            scales["shape"] != [row_count, groups]
-            or biases["shape"] != [row_count, groups]
-        ):
+        if scales["shape"] != [row_count, groups] or biases["shape"] != [
+            row_count,
+            groups,
+        ]:
             raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 shape layout")
         shards.append(
             {
