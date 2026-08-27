@@ -77,6 +77,19 @@ def test_quantized_mmap_lookup_matches_resident_dequantization(tmp_path):
     assert store.stats.bytes_read == 4 * (20 * 4 + 5 * 2 + 5 * 2)
 
 
+def test_quantized_mmap_lookup_preserves_unsorted_unique_ids(tmp_path):
+    table = mx.arange(8 * 160).reshape(8, 160).astype(mx.float32) / 100
+    path, expected = _write_quantized_store(tmp_path, table)
+    store = QuantizedMMapNGramEmbedding(path)
+    ids = np.array([7, 1, 5, 0])
+    actual = store(ids)
+    mx.eval(actual, expected)
+    np.testing.assert_array_equal(
+        np.asarray(actual.astype(mx.float32)),
+        np.asarray(expected.astype(mx.float32))[ids],
+    )
+
+
 def test_quantized_store_fails_closed_for_truncation_and_escape(tmp_path):
     table = mx.ones((4, 160))
     path, _ = _write_quantized_store(tmp_path, table)

@@ -5,7 +5,6 @@ import mlx.nn as nn
 from ..qwen3_5 import Model as Qwen3_5Model
 from ..qwen3_5.qwen3_5 import sanitize_key
 from .config import ModelConfig
-from .fp8 import convert_qwen4_exp_fp8_weights
 from .language import LanguageModel
 from .vision import VisionModel
 
@@ -25,8 +24,6 @@ class Model(Qwen3_5Model):
         weights = {
             key: value for key, value in weights.items() if not key.startswith("mtp.")
         }
-        weights = convert_qwen4_exp_fp8_weights(weights)
-
         if self.config.text_config.ple_storage:
             weights = {
                 key: value

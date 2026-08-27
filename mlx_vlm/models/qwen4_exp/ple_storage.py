@@ -294,8 +294,10 @@ class QuantizedMMapNGramEmbedding:
         scales = mx.array(_bfloat16_to_float32(scales_np)).astype(mx.bfloat16)
         biases = mx.array(_bfloat16_to_float32(biases_np)).astype(mx.bfloat16)
         values = mx.dequantize(packed, scales, biases, group_size=32, bits=4)
-        if duplicate_count:
-            values = values[mx.array(inverse, dtype=mx.int64)]
+        # np.unique sorts even when every ID is distinct, so the inverse is
+        # required to restore caller order in both the unique and duplicate
+        # cases.
+        values = values[mx.array(inverse, dtype=mx.int64)]
         self._lookups += 1
         self._rows += ids.size
         self._elapsed += time.perf_counter() - started
