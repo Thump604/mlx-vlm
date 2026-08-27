@@ -200,22 +200,98 @@ class QuantizedMMapNGramEmbedding:
                 return row
         raise IndexError("n-gram row outside mmap table")
 
+    def _read_rows(self, row_ids):
+        """Read each distinct row once, coalescing storage access by layout."""
+        row_ids = np.asarray(row_ids, dtype=np.int64)
+        if row_ids.ndim != 1:
+            raise ValueError("row_ids must be one-dimensional")
+        if not row_ids.size:
+            groups = self.row_width // 32
+            return (
+                np.empty((0, self.row_width // 8), dtype="<u4"),
+                np.empty((0, groups), dtype="<u2"),
+                np.empty((0, groups), dtype="<u2"),
+            )
+
+        rows = [None] * len(row_ids)
+        missing_positions = []
+        missing_ids = []
+        for position, row_id in enumerate(row_ids.tolist()):
+            cached = self._cache.get(row_id)
+            if cached is None:
+                missing_positions.append(position)
+                missing_ids.append(row_id)
+                continue
+            self._hits += 1
+            self._cache.move_to_end(row_id)
+            rows[position] = cached
+
+        if missing_ids and self._interleaved is not None:
+            raw = np.array(self._interleaved[np.asarray(missing_ids)], copy=True)
+            packed_bytes = self.row_width // 2
+            aux_bytes = self.row_width // 32 * 2
+            packed = raw[:, :packed_bytes].reshape(len(missing_ids), -1).view("<u4")
+            scales = raw[
+                :, packed_bytes : packed_bytes + aux_bytes
+            ].reshape(len(missing_ids), -1).view("<u2")
+            biases = raw[:, packed_bytes + aux_bytes :].reshape(
+                len(missing_ids), -1
+            ).view("<u2")
+            loaded = list(zip(packed, scales, biases))
+            self._bytes += raw.nbytes
+        elif missing_ids:
+            loaded = [None] * len(missing_ids)
+            missing_array = np.asarray(missing_ids)
+            for start, end, arrays in self._shards:
+                selected = np.flatnonzero(
+                    (missing_array >= start) & (missing_array < end)
+                )
+                if not selected.size:
+                    continue
+                local = missing_array[selected] - start
+                weight = np.array(arrays["weight"][local], copy=True)
+                scales = np.array(arrays["scales"][local], copy=True)
+                biases = np.array(arrays["biases"][local], copy=True)
+                self._bytes += weight.nbytes + scales.nbytes + biases.nbytes
+                for output_index, row in zip(
+                    selected.tolist(), zip(weight, scales, biases)
+                ):
+                    loaded[output_index] = row
+            if any(row is None for row in loaded):
+                raise IndexError("n-gram row outside mmap table")
+        else:
+            loaded = []
+
+        self._misses += len(missing_ids)
+        for position, row_id, row in zip(missing_positions, missing_ids, loaded):
+            rows[position] = row
+            if self.cache_rows:
+                self._cache[row_id] = row
+                self._cache.move_to_end(row_id)
+                while len(self._cache) > self.cache_rows:
+                    self._cache.popitem(last=False)
+
+        return tuple(np.stack([row[index] for row in rows]) for index in range(3))
+
     def __call__(self, row_ids):
         started = time.perf_counter()
         ids = np.asarray(row_ids).astype(np.int64, copy=False)
         if ids.size and (ids.min() < 0 or ids.max() >= self.row_count):
             raise IndexError("n-gram row outside mmap table")
-        rows = [self._read_row(int(row_id)) for row_id in ids.reshape(-1)]
-        if not rows:
+        flat_ids = ids.reshape(-1)
+        if not flat_ids.size:
             return mx.zeros((*ids.shape, self.row_width), dtype=mx.bfloat16)
-        packed = mx.array(np.stack([row[0] for row in rows]), dtype=mx.uint32)
-        scales = mx.array(
-            _bfloat16_to_float32(np.stack([row[1] for row in rows]))
-        ).astype(mx.bfloat16)
-        biases = mx.array(
-            _bfloat16_to_float32(np.stack([row[2] for row in rows]))
-        ).astype(mx.bfloat16)
+
+        unique_ids, inverse = np.unique(flat_ids, return_inverse=True)
+        packed_np, scales_np, biases_np = self._read_rows(unique_ids)
+        duplicate_count = flat_ids.size - unique_ids.size
+        self._hits += duplicate_count
+        packed = mx.array(packed_np, dtype=mx.uint32)
+        scales = mx.array(_bfloat16_to_float32(scales_np)).astype(mx.bfloat16)
+        biases = mx.array(_bfloat16_to_float32(biases_np)).astype(mx.bfloat16)
         values = mx.dequantize(packed, scales, biases, group_size=32, bits=4)
+        if duplicate_count:
+            values = values[mx.array(inverse, dtype=mx.int64)]
         self._lookups += 1
         self._rows += ids.size
         self._elapsed += time.perf_counter() - started
