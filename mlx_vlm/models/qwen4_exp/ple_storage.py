@@ -321,8 +321,9 @@ def build_quantized_ple_manifest(model_path, output_path, *, cache_rows=0):
     """Index Q4 PLE tensors in place without copying their payload bytes."""
 
     model_path = Path(model_path).resolve()
-    output_path = Path(output_path)
+    output_path = Path(output_path).resolve()
     index = json.loads((model_path / "model.safetensors.index.json").read_text())
+    config = json.loads((model_path / "config.json").read_text())
     weight_map = index["weight_map"]
     prefixes = {key.rsplit(".", 1)[0] for key in weight_map if PLE_MARKER in key}
     if not prefixes:
@@ -352,10 +353,29 @@ def build_quantized_ple_manifest(model_path, output_path, *, cache_rows=0):
     row_start = 0
     ordered_prefixes = sorted(prefixes, key=lambda value: int(value.rsplit(".", 1)[1]))
     for prefix in ordered_prefixes:
+        quantization = config.get("quantization_config") or config.get(
+            "quantization", {}
+        )
+        params = quantization.get(prefix, quantization)
+        expected = {"bits": 4, "group_size": 32, "mode": "affine"}
+        if any(params.get(key) != value for key, value in expected.items()):
+            raise ValueError(f"PLE tensor {prefix!r} is not affine Q4/group-32")
         weight = tensor_descriptor(f"{prefix}.weight")
         scales = tensor_descriptor(f"{prefix}.scales")
         biases = tensor_descriptor(f"{prefix}.biases")
+        if weight["dtype"] != "U32" or any(
+            item["dtype"] != "BF16" for item in (scales, biases)
+        ):
+            raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 dtype layout")
+        if len(weight["shape"]) != 2 or int(weight["shape"][1]) % 4:
+            raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 shape layout")
         row_count = int(weight["shape"][0])
+        groups = int(weight["shape"][1]) // 4
+        if (
+            scales["shape"] != [row_count, groups]
+            or biases["shape"] != [row_count, groups]
+        ):
+            raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 shape layout")
         shards.append(
             {
                 "row_start": row_start,
@@ -368,7 +388,7 @@ def build_quantized_ple_manifest(model_path, output_path, *, cache_rows=0):
         row_start += row_count
     manifest = {
         "version": QuantizedMMapNGramEmbedding.MANIFEST_VERSION,
-        "source_root": str(model_path),
+        "source_root": os.path.relpath(model_path, output_path.parent),
         "layout": "safetensors_ranges",
         "row_width": int(shards[0]["weight"]["shape"][1]) * 8,
         "row_count": row_start,
@@ -397,6 +417,9 @@ def materialize_interleaved_ple_store(
         raise ValueError("data_file must be a filename beside the manifest")
     if chunk_rows <= 0:
         raise ValueError("chunk_rows must be positive")
+    data_path = manifest_path.parent / data_name
+    if data_path.exists():
+        raise FileExistsError(f"PLE row store already exists: {data_path}")
     range_manifest = build_quantized_ple_manifest(
         model_path, manifest_path, cache_rows=cache_rows
     )
@@ -404,13 +427,10 @@ def materialize_interleaved_ple_store(
     packed_bytes = row_width // 2
     aux_bytes = row_width // 32 * 2
     row_stride = packed_bytes + 2 * aux_bytes
-    data_path = manifest_path.parent / data_name
-    if data_path.exists():
-        raise FileExistsError(f"PLE row store already exists: {data_path}")
     total_size = int(range_manifest["row_count"]) * row_stride
     with data_path.open("wb") as stream:
         stream.truncate(total_size)
-    source_root = Path(range_manifest["source_root"])
+    source_root = (manifest_path.parent / range_manifest["source_root"]).resolve()
     for shard in range_manifest["shards"]:
         arrays = {}
         for name in ("weight", "scales", "biases"):
@@ -453,7 +473,9 @@ def materialize_interleaved_ple_store(
         del arrays
     manifest = {
         "version": QuantizedMMapNGramEmbedding.MANIFEST_VERSION,
-        "source_root": str(Path(model_path).resolve()),
+        "source_root": os.path.relpath(
+            Path(model_path).resolve(), manifest_path.parent
+        ),
         "layout": "interleaved_q4",
         "data_file": data_name.name,
         "row_width": row_width,
