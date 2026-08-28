@@ -330,3 +330,54 @@ def test_materialize_checks_existing_data_before_rewriting_manifest(tmp_path):
         materialize_interleaved_ple_store(source, manifest_path)
 
     assert manifest_path.read_text() == original_manifest
+
+
+def test_materialize_does_not_publish_partial_store(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    table = mx.ones((8, 160))
+    weight, scales, biases = mx.quantize(table, group_size=32, bits=4)
+    prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0"
+    tensors = {
+        f"{prefix}.weight": weight,
+        f"{prefix}.scales": scales.astype(mx.bfloat16),
+        f"{prefix}.biases": biases.astype(mx.bfloat16),
+        "language_model.embed_tokens.weight": mx.ones((2, 2)),
+    }
+    file_name = "model.safetensors"
+    mx.save_safetensors(str(source / file_name), tensors)
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": {key: file_name for key in tensors}})
+    )
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "text_config": {},
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "mode": "affine",
+                    prefix: {"bits": 4, "group_size": 32, "mode": "affine"},
+                },
+            }
+        )
+    )
+    prepare_external_ple_model(source, target)
+    manifest_path = target / "ple-store.json"
+    original_manifest = manifest_path.read_text()
+    original_memmap = np.memmap
+
+    def fail_output_mapping(*args, **kwargs):
+        if kwargs.get("mode") == "r+":
+            raise OSError("simulated write failure")
+        return original_memmap(*args, **kwargs)
+
+    monkeypatch.setattr(np, "memmap", fail_output_mapping)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        materialize_interleaved_ple_store(source, manifest_path)
+
+    assert manifest_path.read_text() == original_manifest
+    assert not (target / "ple-q4.rows").exists()
+    assert list(target.glob(".ple-q4.rows.*.partial")) == []

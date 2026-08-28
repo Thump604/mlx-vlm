@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import struct
+import tempfile
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -481,47 +482,58 @@ def materialize_interleaved_ple_store(
         if name != "weight"
     )
     total_size = int(range_manifest["row_count"]) * row_stride
-    with data_path.open("wb") as stream:
-        stream.truncate(total_size)
-    source_root = (manifest_path.parent / range_manifest["source_root"]).resolve()
-    for shard in range_manifest["shards"]:
-        arrays = {}
-        for name, _dtype in tensor_layout:
-            tensor = shard[name]
-            arrays[name] = np.memmap(
-                source_root / tensor["file"],
-                dtype=_DTYPES[tensor["dtype"]],
-                mode="r",
-                offset=int(tensor["offset"]),
-                shape=tuple(tensor["shape"]),
-            )
-        row_start = int(shard["row_start"])
-        row_count = int(shard["row_count"])
-        for local_start in range(0, row_count, chunk_rows):
-            local_end = min(local_start + chunk_rows, row_count)
-            output = np.memmap(
-                data_path,
-                dtype=np.uint8,
-                mode="r+",
-                offset=(row_start + local_start) * row_stride,
-                shape=(local_end - local_start, row_stride),
-            )
-            offset = 0
-            for name, dtype_name in tensor_layout:
-                byte_count = (
-                    packed_bytes
-                    if name == "weight"
-                    else row_width // group_size * _DTYPES[dtype_name].itemsize
+    descriptor, partial_name = tempfile.mkstemp(
+        prefix=f".{data_name.name}.",
+        suffix=".partial",
+        dir=manifest_path.parent,
+    )
+    os.close(descriptor)
+    partial_path = Path(partial_name)
+    try:
+        with partial_path.open("wb") as stream:
+            stream.truncate(total_size)
+        source_root = (manifest_path.parent / range_manifest["source_root"]).resolve()
+        for shard in range_manifest["shards"]:
+            arrays = {}
+            for name, _dtype in tensor_layout:
+                tensor = shard[name]
+                arrays[name] = np.memmap(
+                    source_root / tensor["file"],
+                    dtype=_DTYPES[tensor["dtype"]],
+                    mode="r",
+                    offset=int(tensor["offset"]),
+                    shape=tuple(tensor["shape"]),
                 )
-                output[:, offset : offset + byte_count] = (
-                    np.asarray(arrays[name][local_start:local_end])
-                    .view(np.uint8)
-                    .reshape(local_end - local_start, byte_count)
+            row_start = int(shard["row_start"])
+            row_count = int(shard["row_count"])
+            for local_start in range(0, row_count, chunk_rows):
+                local_end = min(local_start + chunk_rows, row_count)
+                output = np.memmap(
+                    partial_path,
+                    dtype=np.uint8,
+                    mode="r+",
+                    offset=(row_start + local_start) * row_stride,
+                    shape=(local_end - local_start, row_stride),
                 )
-                offset += byte_count
-            output.flush()
-            del output
-        del arrays
+                offset = 0
+                for name, dtype_name in tensor_layout:
+                    byte_count = (
+                        packed_bytes
+                        if name == "weight"
+                        else row_width // group_size * _DTYPES[dtype_name].itemsize
+                    )
+                    output[:, offset : offset + byte_count] = (
+                        np.asarray(arrays[name][local_start:local_end])
+                        .view(np.uint8)
+                        .reshape(local_end - local_start, byte_count)
+                    )
+                    offset += byte_count
+                output.flush()
+                del output
+            del arrays
+        os.link(partial_path, data_path)
+    finally:
+        partial_path.unlink(missing_ok=True)
     manifest = {
         "version": QuantizedMMapNGramEmbedding.MANIFEST_VERSION,
         "source_root": os.path.relpath(
